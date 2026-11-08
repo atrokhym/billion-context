@@ -166,13 +166,35 @@ export function planForkAdoption(
     const byId = new Map<string, CompressionBlock>();
     for (const b of parent.state.blocks) byId.set(b.blockId, b);
 
-    const active: CompressionBlock[] = [];
+    // A block consumed by another (its parent) inherits only as that parent's
+    // inactive tier descendant, never as an independent adoptable — compute the
+    // consumed set once so the loop below can exclude it from top-level adoption.
+    const consumedIds = new Set<string>();
+    for (const b of parent.state.blocks) for (const cid of b.directBlockIds) consumedIds.add(cid);
+
+    const adoptable: CompressionBlock[] = [];
     let straddled = 0;
     if (includeBlocks) {
         for (const b of parent.state.blocks) {
-            if (!b.active) continue;
+            // Adoptability is judged against the CHILD's incoming ids, not the
+            // parent's current `active` flag. The parent's LAST request may have
+            // been a short or unrelated view (a subagent call, a side persona)
+            // whose syncBlocks pass deactivated every retained fold whose raw
+            // messages were absent from that view. A normal full replay would
+            // reactivate them, but a fork must not hinge on the luck of the
+            // parent's final view: if the fold's source content is FULLY present
+            // in the child, the fold is inheritable regardless of the parent's
+            // transient active state (#5968). Two exclusions preserve the
+            // parent's INTENTIONAL deactivations:
+            //   - expanded: the user explicitly decompressed this block, so its
+            //     deactivated state is deliberate; re-folding it in the child
+            //     would silently undo the expansion (double cost + lost originals).
+            //   - consumed-tier: the block is another block's child; it rides
+            //     along only as that parent's inactive descendant (closure below).
+            if (b.expanded) continue;
+            if (consumedIds.has(b.blockId)) continue;
             if (b.effectiveMessageIds.length === 0) continue;
-            if (b.effectiveMessageIds.every((id) => incomingIds.has(id))) active.push(b);
+            if (b.effectiveMessageIds.every((id) => incomingIds.has(id))) adoptable.push(b);
             else straddled++;
         }
     }
@@ -181,7 +203,7 @@ export function planForkAdoption(
     // inactive records they are in the parent (their summaries back
     // decompress/acp_status history; they fold nothing on their own).
     const closure = new Set<string>();
-    const queue = active.map((b) => b.blockId);
+    const queue = adoptable.map((b) => b.blockId);
     while (queue.length > 0) {
         const id = queue.pop()!;
         if (closure.has(id)) continue;
@@ -189,12 +211,19 @@ export function planForkAdoption(
         for (const child of byId.get(id)?.directBlockIds ?? []) queue.push(child);
     }
 
+    // Top-level adopted blocks are copied ACTIVE — their content is fully present
+    // in the child, so the fold is live again there even though the parent's last
+    // view had transiently deactivated it (#5968). Tier descendants keep their
+    // consumed-by-parent INACTIVE state.
+    const topLevel = new Set(adoptable.map((b) => b.blockId));
     const blocks: CompressionBlock[] = [];
     const rawIds = new Set<string>();
     for (const id of closure) {
         const b = byId.get(id);
         if (!b) continue;
-        blocks.push(structuredClone(b));
+        const clone = structuredClone(b);
+        clone.active = topLevel.has(id);
+        blocks.push(clone);
         for (const mid of b.effectiveMessageIds) rawIds.add(mid);
     }
     if (opts?.seedAllRefs) {
@@ -227,8 +256,8 @@ export function planForkAdoption(
     return {
         blocks,
         blockIds: closure,
-        adoptedActive: active.length,
-        adoptedTokens: active.reduce((sum, b) => sum + b.compressedTokens, 0),
+        adoptedActive: adoptable.length,
+        adoptedTokens: adoptable.reduce((sum, b) => sum + b.compressedTokens, 0),
         straddled,
         maxRef,
         refs: { byRaw, byRef },
